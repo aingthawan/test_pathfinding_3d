@@ -1,95 +1,149 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.interpolate import CubicHermiteSpline
+from mpl_toolkits.mplot3d import Axes3D
 
-def get_tube_surface(curve, radius, n_segments=15):
-    """Generates X, Y, Z mesh grids for a tube around a 3D curve."""
-    n_points = len(curve)
-    theta = np.linspace(0, 2 * np.pi, n_segments)
+class WorldOrder:
+    """Bounding box and collision container."""
+    def __init__(self, bounds=(100, 100, 100)):
+        self.bounds = np.array(bounds)
+        self.obstacles = []      # List of (min_corner, max_corner)
+        self.baked_paths = []
 
-    # Storage for mesh vertices
-    X, Y, Z = np.zeros((n_points, n_segments)), np.zeros((n_points, n_segments)), np.zeros((n_points, n_segments))
+    def add_obstacle(self, center, size):
+        center, size = np.array(center), np.array(size)
+        min_c = center - (size / 2)
+        max_c = center + (size / 2)
+        self.obstacles.append((min_c, max_c))
 
-    for i in range(n_points):
-        p = curve[i]
-        # Calculate tangent vector for the orientation of the circle
-        if i < n_points - 1:
-            tangent = curve[i+1] - curve[i]
-        else:
-            tangent = curve[i] - curve[i-1]
+    def _get_cube_edges(self, min_c, max_c):
+        """Helper to calculate the 12 lines of a box for plotting."""
+        # The 8 vertices of a box
+        z = np.array([
+            [min_c[0], min_c[1], min_c[2]],
+            [max_c[0], min_c[1], min_c[2]],
+            [max_c[0], max_c[1], min_c[2]],
+            [min_c[0], max_c[1], min_c[2]],
+            [min_c[0], min_c[1], max_c[2]],
+            [max_c[0], min_c[1], max_c[2]],
+            [max_c[0], max_c[1], max_c[2]],
+            [min_c[0], max_c[1], max_c[2]],
+        ])
 
-        tangent /= np.linalg.norm(tangent)
+        # List of vertex pairs to connect for edges
+        edges = [
+            [z[0],z[1]], [z[1],z[2]], [z[2],z[3]], [z[3],z[0]],
+            [z[4],z[5]], [z[5],z[6]], [z[6],z[7]], [z[7],z[4]],
+            [z[0],z[4]], [z[1],z[5]], [z[2],z[6]], [z[3],z[7]],
+        ]
+        return edges
 
-        # Create an orthogonal basis (Normal and Binormal)
-        helper = np.array([1, 0, 0]) if abs(tangent[0]) < 0.9 else np.array([0, 1, 0])
-        normal = np.cross(tangent, helper)
-        normal /= np.linalg.norm(normal)
-        binormal = np.cross(tangent, normal)
+class Collector:
+    """Manifold that generates specific entry/exit ports."""
 
-        # Create the ring of points around the centerline
-        for j, t in enumerate(theta):
-            ring_point = p + radius * (np.cos(t) * normal + np.sin(t) * binormal)
-            X[i, j], Y[i, j], Z[i, j] = ring_point
+    def __init__(self, pos=(0,0,0), direction=(0,0,1), num_ports=4, radius=5.0, length=10.0):
+        # pos: 3D coordinates (base center)
+        # direction: exit direction (end_dir)
+        # num_ports: total number of ports (n)
+        # radius: radial distance from center axis to port center (r)
+        # length: distance from base to end port (l)
 
-    return X, Y, Z
+        self.pos = np.array(pos)
+        self.direction = self._normalize(np.array(direction))
+        self.n = num_ports
+        self.r = radius
+        self.l = length
 
-# --- CONFIGURATION ---
-radius = 1.0  # Physical thickness of the spline
-bounds = {'x': (0, 15), 'y': (0, 15), 'z': (0, 20)}
+        # Generate port positions
+        self.ports = self._generate_ports()
 
-# Start points and one End point (inside the bounds)
-# starts = np.array([
-#     [0, 12.5, 20],
-#     [0, 7.5, 20],
-#     [0, 5, 20],
-#     [0, 0, 20],
-# ])
-starts = np.array([
-    [0, 12.5, 20],
-    [0, 10, 20],
-    [0, 7.5, 20],
-    [0, 5, 20],
-    [0, 2.5, 20],
-    [0, 0, 20],
+    def _normalize(self, v):
+        norm = np.linalg.norm(v)
+        return v / norm if norm > 0 else v
+
+    def _get_orthogonal_basis(self):
+        """Creates vectors u and v perpendicular to the manifold direction."""
+        # Pick an arbitrary vector not parallel to direction
+        pick = np.array([1, 0, 0]) if abs(self.direction[0]) < 0.9 else np.array([0, 1, 0])
+        u = self._normalize(np.cross(self.direction, pick))
+        v = np.cross(self.direction, u)
+        return u, v
+
+    def _generate_ports(self):
+        """Generates port positions spaced by 360/n degrees."""
+        ports = []
+        u, v = self._get_orthogonal_basis()
+
+        angle_step = 2 * np.pi / self.n
+
+        for i in range(self.n):
+            theta = i * angle_step
+            # Calculate position on the radial ring
+            radial_offset = self.r * (np.cos(theta) * u + np.sin(theta) * v)
+            port_pos = self.pos + radial_offset
+
+            ports.append({
+                'id': i,
+                'position': port_pos,
+                # 'normal': self._normalize(radial_offset),
+                'normal': self.direction,
+            })
+        return ports
+
+    def get_end_point(self):
+        """Returns the 'end port' location."""
+        return self.pos + (self.direction * self.l)
+
+class SplinePath:
+    """Data container for a single routed pipe."""
+    def __init__(self, start_pos, end_pos, start_dir, end_dir, radius=1.0):
+        self.start_pos = np.array(start_pos)
+        self.start_dir = self._normalize(np.array(start_dir))
+        self.end_pos = np.array(end_pos)
+        self.end_dir = self._normalize(np.array(end_dir))
+
+        self.radius = radius
+        self.coords = [self.start_pos]  # Initialize with start point
+        self.length = 0.0
+        self.complete = False
+
+    def _normalize(self, v):
+        norm = np.linalg.norm(v)
+        return v / norm if norm > 0 else v
+
+    def update_path(self, new_coords):
+        """Updates the path points and recalculates total length."""
+        self.coords = np.array(new_coords)
+        # Calculate length by summing distances between consecutive points
+        diffs = np.diff(self.coords, axis=0)
+        self.length = np.sum(np.sqrt((diffs**2).sum(axis=1)))
+
+        # Check if the last point is close enough to end_pos to call it 'complete'
+        if np.linalg.norm(self.coords[-1] - self.end_pos) < 1e-3:
+            self.complete = True
+
+    def get_bend_angles(self):
+        """Returns the angles between segments to check if bend < 90 deg."""
+        vectors = np.diff(self.coords, axis=0)
+        norms = np.linalg.norm(vectors, axis=1)
+        angles = []
+        for i in range(len(vectors) - 1):
+            v1 = vectors[i] / norms[i]
+            v2 = vectors[i+1] / norms[i+1]
+            angle = np.degrees(np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0)))
+            angles.append(angle)
+        return angles
+
+start_pos = np.array([
+    [7, 0, 7],
+    [7, 5, 7],
+    [7, 10, 7],
+    [7, 15, 7],
 ])
-end = np.array([2.5, 15, 0])
-
-# Directions (Tangents) - Multiplier controls the "bend" radius
-start_dir = np.array([1, 0, 0]) * 50
-end_dir = np.array([0, 1, 0]) * 20
-
-# --- PLOTTING ---
-fig = plt.figure(figsize=(12, 10))
-ax = fig.add_subplot(111, projection='3d')
-
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', "#600505", "#27d3d6"]
-
-for i, p_start in enumerate(starts):
-    # Create the Spline
-    spline = CubicHermiteSpline([0, 1], [p_start, end], [start_dir, end_dir])
-    t_steps = np.linspace(0, 1, 40)
-    curve = spline(t_steps)
-
-    # Generate the 3D Pipe Surface
-    X, Y, Z = get_tube_surface(curve, radius)
-
-    # Plot the surface
-    ax.plot_surface(X, Y, Z, color=colors[i], alpha=0.6, linewidth=0, antialiased=True)
-    # Plot the centerline for clarity
-    ax.plot(curve[:,0], curve[:,1], curve[:,2], color='black', lw=1, alpha=0.5)
-
-# Draw Bounding Box (Wireframe)
-for x in bounds['x']:
-    for y in bounds['y']:
-        ax.plot([x, x], [y, y], bounds['z'], color='gray', linestyle='--', alpha=0.3)
-for x in bounds['x']:
-    for z in bounds['z']:
-        ax.plot([x, x], bounds['y'], [z, z], color='gray', linestyle='--', alpha=0.3)
-for y in bounds['y']:
-    for z in bounds['z']:
-        ax.plot(bounds['x'], [y, y], [z, z], color='gray', linestyle='--', alpha=0.3)
-
-ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-ax.set_title(f"3D Manifold: 4 Starts to 1 End (Radius r={radius})")
-ax.view_init(elev=20, azim=45)
-plt.show()
+my_world = WorldOrder(bounds=(20, 20, 20))
+coll = Collector(
+    pos=(0, 0, 0),
+    direction=(0, 0, -1),
+    num_ports=4,
+    radius=4,
+    length=12
+)
