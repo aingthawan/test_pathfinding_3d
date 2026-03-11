@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 class WorldOrder:
     """Bounding box and collision container."""
@@ -94,7 +93,7 @@ class Collector:
         return self.pos + (self.direction * self.l)
 
 class SplinePath:
-    """Data container for a single routed pipe."""
+    """Data container for a single routed pipe using Cubic Bézier interpolation."""
     def __init__(self, start_pos, end_pos, start_dir, end_dir, radius=1.0):
         self.start_pos = np.array(start_pos)
         self.start_dir = self._normalize(np.array(start_dir))
@@ -102,7 +101,7 @@ class SplinePath:
         self.end_dir = self._normalize(np.array(end_dir))
 
         self.radius = radius
-        self.coords = [self.start_pos]  # Initialize with start point
+        self.coords = []
         self.length = 0.0
         self.complete = False
 
@@ -110,40 +109,169 @@ class SplinePath:
         norm = np.linalg.norm(v)
         return v / norm if norm > 0 else v
 
+    def generate_bezier(self, multiplier, num_points=50):
+        """
+        Calculates a smooth curve using start/end points and tangents.
+        P1 and P2 are determined by the 'multiplier' (stiffness).
+        """
+        # Control Point 0: The start
+        p0 = self.start_pos
+        # Control Point 1: Extruded from start along start_dir
+        p1 = self.start_pos + (self.start_dir * multiplier)
+        # Control Point 2: Backed off from end along end_dir
+        p2 = self.end_pos - (self.end_dir * multiplier)
+        # Control Point 3: The actual port
+        p3 = self.end_pos
+
+        # Generate t-values from 0 to 1
+        t = np.linspace(0, 1, num_points)[:, None]
+
+        # Cubic Bézier Formula: (1-t)^3*P0 + 3(1-t)^2*t*P1 + 3(1-t)t^2*P2 + t^3*P3
+        bezier_coords = (1 - t)**3 * p0 + \
+                        3 * (1 - t)**2 * t * p1 + \
+                        3 * (1 - t) * t**2 * p2 + \
+                        t**3 * p3
+
+        self.update_path(bezier_coords)
+
     def update_path(self, new_coords):
-        """Updates the path points and recalculates total length."""
+        """Updates coordinates and calculates the actual arc length."""
         self.coords = np.array(new_coords)
-        # Calculate length by summing distances between consecutive points
+        # Sum of Euclidean distances between each sampled point
         diffs = np.diff(self.coords, axis=0)
         self.length = np.sum(np.sqrt((diffs**2).sum(axis=1)))
 
-        # Check if the last point is close enough to end_pos to call it 'complete'
-        if np.linalg.norm(self.coords[-1] - self.end_pos) < 1e-3:
+        if np.linalg.norm(self.coords[-1] - self.end_pos) < 0.1:
             self.complete = True
 
-    def get_bend_angles(self):
-        """Returns the angles between segments to check if bend < 90 deg."""
+    def get_max_bend(self):
+        """Calculates the sharpest angle in the path to verify < 90 deg."""
+        if len(self.coords) < 3: return 0.0
+
         vectors = np.diff(self.coords, axis=0)
         norms = np.linalg.norm(vectors, axis=1)
-        angles = []
+
+        max_angle = 0.0
         for i in range(len(vectors) - 1):
+            # Cosine similarity between adjacent segments
             v1 = vectors[i] / norms[i]
             v2 = vectors[i+1] / norms[i+1]
-            angle = np.degrees(np.arccos(np.clip(np.dot(v1, v2), -1.0, 1.0)))
-            angles.append(angle)
-        return angles
+            dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
+            angle = np.degrees(np.acos(dot))
+            if angle > max_angle:
+                max_angle = angle
+        return max_angle
 
+class RouterManager:
+    def __init__(self, world, collector, starts):
+        self.world = world
+        self.collector = collector
+        self.starts = np.array(starts)
+        self.paths = []
+        self.reference_length = 0.0
+
+    def _get_furthest_pairing(self):
+        """Rank starts to ports and find the global furthest for the Master Path."""
+        max_dist = -1
+        best_pair = (None, None)
+        port_positions = [p['position'] for p in self.collector.ports]
+
+        for s_idx, s_pos in enumerate(self.starts):
+            for p_idx, p_pos in enumerate(port_positions):
+                dist = np.linalg.norm(s_pos - p_pos)
+                if dist > max_dist:
+                    max_dist = dist
+                    best_pair = (s_idx, p_idx)
+        return best_pair
+
+    def run_routing(self, base_multiplier=2.0):
+        # 1. Identify the 'Master' (furthest) route
+        start_idx, port_idx = self._get_furthest_pairing()
+
+        # 2. Generate Master Path with base stiffness
+        master_path = self._create_curved_path(start_idx, port_idx, multiplier=base_multiplier)
+        self.reference_length = master_path.length
+        self.paths.append(master_path)
+
+        print(f"Master Route: Start {start_idx} -> Port {port_idx}")
+        print(f"Reference Length Set: {self.reference_length:.2f}")
+
+        # 3. Route the rest and match length by increasing multiplier
+        remaining_starts = [i for i in range(len(self.starts)) if i != start_idx]
+        remaining_ports = [i for i in range(len(self.collector.ports)) if i != port_idx]
+
+        for s_idx, p_idx in zip(remaining_starts, remaining_ports):
+            # Start with base stiffness
+            mult = base_multiplier
+            path = self._create_curved_path(s_idx, p_idx, multiplier=mult)
+
+            # Iterative Multiplier adjustment to match length
+            # We increase 'stiffness' to force a wider, longer curve
+            while path.length < self.reference_length and mult < 15.0:
+                mult += 0.5
+                path = self._create_curved_path(s_idx, p_idx, multiplier=mult)
+
+            self.paths.append(path)
+            print(f"Matched Path: Start {s_idx} | Multiplier: {mult:.1f} | Length: {path.length:.2f}")
+
+    def _create_curved_path(self, s_idx, p_idx, multiplier):
+        start_p = self.starts[s_idx]
+        port = self.collector.ports[p_idx]
+
+        # 1. Start Direction: Shoot out along +X away from the wall
+        s_dir = np.array([1, 0, 0])
+
+        # 2. End Direction: Entry into the port
+        # We use the port's normal (collector's axis)
+        e_dir = port['normal']
+
+        # 3. Define Path Object
+        path = SplinePath(start_p, port['position'], s_dir, e_dir)
+
+        # 4. FIX: Call 'generate_bezier' (the name used in the SplinePath class)
+        # We don't need to pass p0-p3 manually anymore; the method handles it
+        # using the start/end/dir info already stored in the object.
+        path.generate_bezier(multiplier=multiplier, num_points=50)
+
+        return path
+
+    def plot_all(self):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Plot Collector
+        ports = np.array([p['position'] for p in self.collector.ports])
+        ax.scatter(ports[:,0], ports[:,1], ports[:,2], c='red', label='Collector Ports')
+
+        # Plot Paths
+        for i, p in enumerate(self.paths):
+            pts = np.array(p.coords)
+            ax.plot(pts[:,0], pts[:,1], pts[:,2], label=f'Path {i} (L={p.length:.1f})')
+
+        ax.set_xlim(0, self.world.bounds[0])
+        ax.set_ylim(0, self.world.bounds[1])
+        ax.set_zlim(0, self.world.bounds[2])
+        ax.legend()
+        plt.show()
+
+# --- Updated Initialization ---
 start_pos = np.array([
-    [7, 0, 7],
-    [7, 5, 7],
-    [7, 10, 7],
-    [7, 15, 7],
+    [0, 0, 7],
+    [0, 5, 7],
+    [0, 10, 7],
+    [0, 15, 7],
 ])
+
 my_world = WorldOrder(bounds=(20, 20, 20))
 coll = Collector(
-    pos=(0, 0, 0),
-    direction=(0, 0, -1),
+    pos=(5, 20, 0),
+    direction=(0, 1, 0), # Pointing down
     num_ports=4,
-    radius=4,
-    length=12
+    radius=2,
+    length=5,
 )
+
+# --- Execution ---
+manager = RouterManager(my_world, coll, start_pos)
+manager.run_routing(base_multiplier=1.5) # Initial 'straight' lead-in
+manager.plot_all()
